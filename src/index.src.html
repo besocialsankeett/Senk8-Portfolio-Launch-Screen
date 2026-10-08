@@ -1,0 +1,1030 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Sanket Athawale · Portfolio Launching Soon</title>
+<meta name="description" content="I build content, campaigns & digital things from scratch. Portfolio launching soon.">
+<meta name="theme-color" content="#f8f8f8">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #f8f8f8; }
+  /* Same fit rule as the WebGL wall (width-fit, bottom-anchored), so nothing jumps when the canvas fades in. */
+  body { background: #f8f8f8 no-repeat center bottom / 100% auto; }
+  #stage { position: fixed; inset: 0; }
+  #stage canvas { display: block; width: 100%; height: 100%; opacity: 0; transition: opacity .5s ease; touch-action: none; outline: none; }
+  #stage canvas.ready { opacity: 1; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  #fallback { display: none; position: fixed; left: 50%; top: 12%; height: 62%; transform: translateX(-50%) rotate(-3deg); border-radius: 6px; box-shadow: 0 2px 4px rgba(0,0,0,.08), 18px 28px 50px rgba(20,24,40,.18); }
+  body.no-webgl #fallback { display: block; }
+</style>
+</head>
+<body>
+<script id="assets" type="application/json">{"card":"__CARD_DATA__","bg":"__BG_DATA__"}</script>
+<script>
+  // Paint the background immediately (before three.js loads) so the first frame is never blank.
+  window.__ASSETS = JSON.parse(document.getElementById('assets').textContent);
+  document.body.style.backgroundImage = 'url(' + window.__ASSETS.bg + ')';
+</script>
+<h1 class="sr-only">Sanket Athawale: I build content, campaigns &amp; digital things from scratch. Portfolio launching soon.</h1>
+<div id="stage" aria-hidden="true"></div>
+<img id="fallback" alt="" />
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/"
+} }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+
+const ASSETS = window.__ASSETS;
+const IMG_ASPECT = 2000 / 975;                 // background.webp
+const REDUCED = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const DEBUG = new URLSearchParams(location.search).has('debug');
+
+/* ==========================================================================
+   TUNABLES  (world units are centimetres)
+   ========================================================================== */
+const CFG = {
+  gravity: 200,          // cm/s². Real is 981; reduced so the free swing has the reference's ~3 s period.
+  substep: 1 / 240,      // fixed physics step
+  iterations: 24,        // constraint solver iterations per step
+  airCard: 0.22,         // linear air drag (1/s)
+  airStrap: 0.7,
+  rotDamp: 1.15,         // extra damping of the card's rotation modes (1/s)
+  neckFriction: 1.2,     // strap sliding over the neck (1/s)
+  torsionHz: 0.65,       // strap twist spring that turns the card back to face you
+  maxSpeed: 240,         // cm/s clamp — a hard real flick is ~100 cm/s; this keeps wild throws on screen
+  tetherK: 1.0,          // how hard the strap's total length holds (lower = a touch of stretch and bounce)
+
+  depth: 3.4,            // how far the hanging card sits in front of the page (cm) → shadow offset
+  hover: { yaw: 14, pitch: 8, lean: 5 },   // degrees, max spring tilt toward the cursor
+  drag: { lift: 3.6, follow: 18, stiffness: 0.32 },
+
+  // One light source: direction toward the light (upper-left, in front of the page).
+  lightDir: new THREE.Vector3(-0.34, 0.50, 1.0).normalize(),
+  keyAngle: 6.5,         // angular radius of the light's bright core, in degrees (tight shadow)
+  ambAngle: 27,          // angular radius of its soft surround (ambient shadow)
+  keyStrength: 0.32,
+  ambStrength: 0.12,
+};
+
+/* ---------- physical dimensions (cm) ---------- */
+const CARD_W = 6.6, CARD_H = CARD_W * 1224 / 792;        // your card art, 792×1224
+const CASE_W = 7.5, CASE_H = 12.8, CASE_R = 0.42;
+const CASE_TOP = 0.85;                                    // case top above the slot centre (local origin = slot)
+const CASE_BOT = CASE_TOP - CASE_H;                       // -11.95
+const SLAB = 0.10, BEVEL_T = 0.03, BEVEL_S = 0.035;       // two vinyl sheets + air gap, welded edge bead
+const WELD = 0.22;
+const SEAL_Y0 = -0.90, SEAL_Y1 = -1.12;                   // zip-seal ridge under the header
+const CARD_TOP = -1.40, CARD_CY = CARD_TOP - CARD_H / 2;  // card rests near the pocket bottom
+const HOLE_X = CASE_W / 2 - 0.78, HOLE_R = 0.21, SLOT_W = 1.42, SLOT_H = 0.32;
+const TRI_A = 3.75, TRI_H = 9.0;                          // physics triangle (centroid ≈ combined centre of mass)
+const CLIP_LEN = 2.2;                                     // slot → top of crimp
+const STRAP_W = 0.62, STRAP_T = 0.06;
+const NECK_D = 36, NECK_R = 7.5;                          // the (off-screen) neck the strap loops over
+const HMAX = 20;                                          // max caster height encoded in the shadow mask
+
+/* ==========================================================================
+   RENDERER / SCENE
+   ========================================================================== */
+const stage = document.getElementById('stage');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance', preserveDrawingBuffer: DEBUG });
+} catch (e) {
+  document.body.classList.add('no-webgl');
+  document.getElementById('fallback').src = ASSETS.card;
+  throw e;
+}
+let pixelRatio = Math.min(devicePixelRatio, 2);
+renderer.setPixelRatio(pixelRatio);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.NoToneMapping;   // keeps whites white: the card and page must stay true to the artwork
+renderer.toneMappingExposure = 1.0;
+stage.appendChild(renderer.domElement);
+const canvas = renderer.domElement;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, 1, 1, 400);
+const FOV_T = Math.tan(THREE.MathUtils.degToRad(15));
+
+const maxAniso = renderer.capabilities.getMaxAnisotropy();
+const loadTex = (src) => new Promise((res) => new THREE.TextureLoader().load(src, (t) => {
+  t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = maxAniso; res(t);
+}));
+
+/* ---------- studio environment (reflections), lit consistently with the shadow light ---------- */
+function makeEnvironment() {
+  const s = new THREE.Scene();
+  s.add(new THREE.Mesh(new THREE.SphereGeometry(60, 48, 24), new THREE.ShaderMaterial({
+    side: THREE.BackSide,
+    vertexShader: `varying vec3 vP; void main(){ vP = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.); }`,
+    fragmentShader: `varying vec3 vP; void main(){
+      float y = vP.y;
+      vec3 c = mix(vec3(0.10), vec3(0.42,0.43,0.45), smoothstep(-0.35, 0.25, y));
+      c = mix(c, vec3(0.75,0.76,0.78), smoothstep(0.25, 0.95, y));
+      gl_FragColor = vec4(c, 1.); }`,
+  })));
+  const panel = (w, h, dir, I, dist = 24) => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(I, I, I), side: THREE.DoubleSide }));
+    m.position.copy(dir).normalize().multiplyScalar(dist); m.lookAt(0, 0, 0); s.add(m);
+  };
+  panel(10, 7, CFG.lightDir, 7);                           // key softbox = the shadow-casting light
+  panel(1.3, 22, new THREE.Vector3(0.95, 0.05, 0.35), 3.2); // narrow strip on the right → a glint that sweeps across
+  panel(26, 1.1, new THREE.Vector3(0.05, 0.9, 0.45), 3.0);  // overhead strip → horizontal sheen line
+  panel(40, 30, new THREE.Vector3(0, 0, 1), 0.35, 30);     // the room behind the viewer (faint veil)
+  panel(60, 40, new THREE.Vector3(0, 0.1, -1), 0.8, 30);   // the white page behind the card
+  const pm = new THREE.PMREMGenerator(renderer);
+  const tex = pm.fromScene(s, 0.015).texture;
+  pm.dispose();
+  return tex;
+}
+scene.environment = makeEnvironment();
+scene.environmentIntensity = 1.0;
+
+const keyLight = new THREE.DirectionalLight(0xffffff, 2.2);   // specular glints only (shadows are custom)
+scene.add(keyLight, keyLight.target);
+
+/* ==========================================================================
+   PROCEDURAL SURFACE DETAIL (scratches, fingerprints, weld, seal)
+   ========================================================================== */
+const rand = (() => { let s = 1337; return () => (s = (s * 16807) % 2147483647) / 2147483647; })();
+const mkCanvas = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+
+function heightToNormal(hCanvas, strength) {
+  const w = hCanvas.width, h = hCanvas.height;
+  const src = hCanvas.getContext('2d').getImageData(0, 0, w, h).data;
+  const out = mkCanvas(w, h), octx = out.getContext('2d'), img = octx.createImageData(w, h), d = img.data;
+  const H = (x, y) => src[(((y + h) % h) * w + ((x + w) % w)) * 4] / 255;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const nx = -(H(x + 1, y) - H(x - 1, y)) * 0.5 * strength;
+    const ny = (H(x, y + 1) - H(x, y - 1)) * 0.5 * strength;   // canvas y is down, texture v is up
+    const l = Math.hypot(nx, ny, 1), i = (y * w + x) * 4;
+    d[i] = (nx / l * 0.5 + 0.5) * 255; d[i + 1] = (ny / l * 0.5 + 0.5) * 255; d[i + 2] = (1 / l * 0.5 + 0.5) * 255; d[i + 3] = 255;
+  }
+  octx.putImageData(img, 0, 0);
+  return out;
+}
+
+function rrPath(ctx, x, y, w, h, r, begin = true) {
+  if (begin) ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+function caseTextures() {
+  const W = 1024, H = Math.round(W * CASE_H / CASE_W), k = W / CASE_W;
+  const X = (x) => (x + CASE_W / 2) * k, Y = (y) => (CASE_TOP - y) * k, S = (v) => v * k;
+
+  // A fingerprint: ridge loops with wobble, fading out from the core. Drawn once, reused on every map.
+  const print = (rx, ry) => {
+    const c = mkCanvas(S(rx * 2.4), S(ry * 2.4)), g = c.getContext('2d'), cx = c.width / 2, cy = c.height / 2;
+    g.strokeStyle = '#fff'; g.lineWidth = 1.6;
+    for (let r = 0.04; r < 1.15; r += 0.035) {
+      g.beginPath();
+      const ph = rand() * 6.28, br = rand() < 0.25 ? rand() * 6 : 99;  // occasional ridge breaks
+      for (let a = 0; a <= 6.3; a += 0.05) {
+        if (Math.abs(a - br) < 0.25) { g.stroke(); g.beginPath(); continue; }
+        const wob = 1 + 0.035 * Math.sin(a * 3 + ph) + 0.02 * Math.sin(a * 7 + ph * 2);
+        const px = cx + Math.cos(a) * S(rx) * r * wob, py = cy + Math.sin(a) * S(ry) * r * wob * (a > 3.14 ? 1.15 : 1);
+        a === 0 ? g.moveTo(px, py) : g.lineTo(px, py);
+      }
+      g.stroke();
+    }
+    g.globalCompositeOperation = 'destination-in';
+    const gr = g.createRadialGradient(cx, cy, 0, cx, cy, Math.max(cx, cy));
+    gr.addColorStop(0, 'rgba(0,0,0,1)'); gr.addColorStop(0.55, 'rgba(0,0,0,.7)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, c.width, c.height);
+    return c;
+  };
+  const prints = [
+    { c: print(0.75, 0.95), x: 2.45, y: -10.3, a: -0.5, alpha: 0.85 },  // thumb, lower right
+    { c: print(0.62, 0.78), x: -2.9, y: -0.2, a: 0.9, alpha: 0.55 },    // finger on the header
+    { c: print(0.55, 0.72), x: -2.2, y: -6.8, a: 2.6, alpha: 0.35 },    // faint, mid left
+  ];
+  const drawPrints = (g, alphaMul) => prints.forEach((p) => {
+    g.save(); g.globalAlpha = p.alpha * alphaMul; g.translate(X(p.x), Y(p.y)); g.rotate(p.a);
+    g.drawImage(p.c, -p.c.width / 2, -p.c.height / 2); g.restore();
+  });
+  const scratches = [];
+  for (let i = 0; i < 46; i++) {
+    const x0 = (rand() - 0.5) * CASE_W, y0 = CASE_BOT + rand() * CASE_H, ang = rand() * Math.PI, len = 0.3 + rand() ** 2 * 4.5;
+    scratches.push({ x0, y0, x1: x0 + Math.cos(ang) * len, y1: y0 + Math.sin(ang) * len, bend: (rand() - 0.5) * 0.6, w: 0.5 + rand() * 1.1, a: 0.25 + rand() * 0.55 });
+  }
+  const swirl = { x: 0.8, y: -7.6 };                      // circular wipe marks from cleaning on a sleeve
+  for (let i = 0; i < 70; i++) {
+    const r = 0.8 + rand() * 2.8, a0 = rand() * 6.28, sweep = 0.15 + rand() * 0.5;
+    scratches.push({ arc: true, r, a0, a1: a0 + sweep, w: 0.5, a: 0.10 + rand() * 0.18 });
+  }
+  const drawScratches = (g, color, alphaMul) => scratches.forEach((s) => {
+    g.strokeStyle = color; g.globalAlpha = s.a * alphaMul; g.lineWidth = s.w; g.beginPath();
+    if (s.arc) g.arc(X(swirl.x), Y(swirl.y), S(s.r), s.a0, s.a1);
+    else { const mx = (s.x0 + s.x1) / 2 + s.bend * (s.y1 - s.y0) * 0.3, my = (s.y0 + s.y1) / 2 - s.bend * (s.x1 - s.x0) * 0.3;
+      g.moveTo(X(s.x0), Y(s.y0)); g.quadraticCurveTo(X(mx), Y(my), X(s.x1), Y(s.y1)); }
+    g.stroke(); g.globalAlpha = 1;
+  });
+  const holes = (g) => {
+    g.beginPath(); g.arc(X(-HOLE_X), Y(0), S(HOLE_R + 0.1), 0, 7); g.moveTo(X(HOLE_X) + S(HOLE_R + 0.1), Y(0)); g.arc(X(HOLE_X), Y(0), S(HOLE_R + 0.1), 0, 7);
+    rrPath(g, X(-SLOT_W / 2 - 0.1), Y(SLOT_H / 2 + 0.1), S(SLOT_W + 0.2), S(SLOT_H + 0.2), S(SLOT_H / 2 + 0.1), false);
+  };
+  // Weld band = whole sleeve minus the clear header and the pocket.
+  const weld = (g, v) => {
+    g.fillStyle = v; g.fillRect(0, 0, W, H);
+  };
+  const clearAreas = (g, v) => {
+    g.fillStyle = v;
+    rrPath(g, S(WELD), S(WELD), W - S(WELD * 2), Y(SEAL_Y0) - S(WELD) - S(0.03), S(0.25)); g.fill();       // header
+    rrPath(g, S(WELD), Y(SEAL_Y1) + S(0.04), W - S(WELD * 2), H - Y(SEAL_Y1) - S(WELD) - S(0.04), S(0.3)); g.fill(); // pocket
+  };
+
+  // ---- roughness (G channel) ----
+  const R = mkCanvas(W, H), r = R.getContext('2d');
+  weld(r, 'rgb(0,80,0)'); clearAreas(r, 'rgb(0,0,0)');   // clear vinyl is optically smooth → the card stays crisp
+  r.fillStyle = 'rgb(0,70,0)'; r.fillRect(S(WELD), Y(SEAL_Y0), W - S(WELD * 2), Y(SEAL_Y1) - Y(SEAL_Y0));
+  r.strokeStyle = 'rgb(0,80,0)'; r.lineWidth = S(0.1); holes(r); r.stroke();
+  r.globalCompositeOperation = 'lighter';
+  r.filter = 'blur(18px)';
+  [[1.6, -4.2, 1.5, 0.035], [-1.8, -9.6, 1.2, 0.045], [0.2, -11.2, 2.2, 0.03]].forEach(([x, y, rr, a]) => {
+    const gr = r.createRadialGradient(X(x), Y(y), 0, X(x), Y(y), S(rr)); gr.addColorStop(0, `rgba(0,255,0,${a})`); gr.addColorStop(1, 'rgba(0,255,0,0)');
+    r.fillStyle = gr; r.fillRect(0, 0, W, H);
+  });
+  r.filter = 'none';
+  r.fillStyle = 'rgba(0,0,0,0)';
+  const tint = (c, rgb) => { const t = mkCanvas(c.width, c.height), g = t.getContext('2d'); g.drawImage(c, 0, 0); g.globalCompositeOperation = 'source-in'; g.fillStyle = rgb; g.fillRect(0, 0, t.width, t.height); return t; };
+  const printsG = prints.map((p) => ({ ...p, c: tint(p.c, 'rgb(0,72,0)') }));
+  printsG.forEach((p) => { r.save(); r.globalAlpha = p.alpha; r.translate(X(p.x), Y(p.y)); r.rotate(p.a); r.drawImage(p.c, -p.c.width / 2, -p.c.height / 2); r.restore(); });
+  drawScratches(r, 'rgb(0,95,0)', 1);
+
+  // ---- transmission (R channel): weld + seal are milky, grease slightly hazy ----
+  const T = mkCanvas(W, H), t = T.getContext('2d');
+  weld(t, 'rgb(175,175,175)'); clearAreas(t, '#fff');
+  t.fillStyle = 'rgb(205,205,205)'; t.fillRect(S(WELD), Y(SEAL_Y0), W - S(WELD * 2), Y(SEAL_Y1) - Y(SEAL_Y0));
+  t.strokeStyle = 'rgb(175,175,175)'; t.lineWidth = S(0.1); holes(t); t.stroke();
+  prints.map((p) => ({ ...p, c: tint(p.c, '#000') })).forEach((p) => { t.save(); t.globalAlpha = p.alpha * 0.11; t.translate(X(p.x), Y(p.y)); t.rotate(p.a); t.drawImage(p.c, -p.c.width / 2, -p.c.height / 2); t.restore(); });
+
+  // ---- height → normal: vinyl waviness, embossed weld, seal ridges, scratch grooves, print ridges ----
+  const Hc = mkCanvas(W, H), h = Hc.getContext('2d');
+  h.fillStyle = 'rgb(128,128,128)'; h.fillRect(0, 0, W, H);
+  h.filter = 'blur(60px)';
+  for (let i = 0; i < 14; i++) { h.fillStyle = rand() < 0.5 ? 'rgba(255,255,255,.10)' : 'rgba(0,0,0,.10)'; h.beginPath(); h.ellipse(rand() * W, rand() * H, 80 + rand() * 220, 60 + rand() * 260, rand() * 3, 0, 7); h.fill(); }
+  h.filter = 'none';
+  // embossed weld: fine dimple grid inside the weld band only
+  h.save(); h.beginPath(); h.rect(0, 0, W, H); rrPath(h, S(WELD), S(WELD), W - S(WELD * 2), H - S(WELD * 2), S(0.3), false); h.clip('evenodd');
+  h.fillStyle = 'rgba(255,255,255,.35)'; h.fillRect(0, 0, W, H);
+  h.fillStyle = 'rgba(0,0,0,.35)';
+  for (let y = 0; y < H; y += 6) for (let x = (y / 6) % 2 ? 3 : 0; x < W; x += 6) h.fillRect(x, y, 2, 2);
+  h.restore();
+  h.filter = 'blur(2px)'; h.strokeStyle = 'rgba(255,255,255,.9)'; h.lineWidth = 5;
+  [SEAL_Y0 + 0.05, SEAL_Y1 - 0.05].forEach((y) => { h.beginPath(); h.moveTo(S(WELD), Y(y)); h.lineTo(W - S(WELD), Y(y)); h.stroke(); });
+  h.filter = 'none';
+  drawScratches(h, '#000', 0.9);
+  drawPrints(h, 0.10);
+  const N = heightToNormal(Hc, 3.2);
+
+  const tex = (c, srgb) => { const x = new THREE.CanvasTexture(c); x.anisotropy = maxAniso; if (srgb) x.colorSpace = THREE.SRGBColorSpace; return x; };
+  return { rough: tex(R), trans: tex(T), normal: tex(N) };
+}
+
+function strapTextures() {
+  const W = 64, H = 256;
+  const C = mkCanvas(W, H), c = C.getContext('2d'), Hc = mkCanvas(W, H), h = Hc.getContext('2d');
+  const ci = c.createImageData(W, H), hi = h.createImageData(W, H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    // 2/2 twill: diagonal ribs + individual yarn bumps + selvedge ribs near both edges
+    const twill = 0.5 + 0.5 * Math.sin(((x + y) / 6) * Math.PI);
+    const yarn = 0.5 + 0.5 * Math.sin((y / 3) * Math.PI) * Math.sin((x / 3) * Math.PI);
+    const edge = Math.exp(-(((x - 4) / 1.6) ** 2)) + Math.exp(-(((x - 59) / 1.6) ** 2));
+    const n = rand();
+    const hv = 0.45 * twill + 0.3 * yarn + 0.35 * edge + 0.12 * n;
+    const i = (y * W + x) * 4;
+    hi.data[i] = hi.data[i + 1] = hi.data[i + 2] = Math.min(255, hv * 200); hi.data[i + 3] = 255;
+    const col = 12 + 7 * twill + 4 * n + 8 * edge;
+    ci.data[i] = col; ci.data[i + 1] = col; ci.data[i + 2] = col + 1; ci.data[i + 3] = 255;
+  }
+  c.putImageData(ci, 0, 0); h.putImageData(hi, 0, 0);
+  const map = new THREE.CanvasTexture(C), nrm = new THREE.CanvasTexture(heightToNormal(Hc, 2.4));
+  [map, nrm].forEach((t) => { t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = maxAniso; });
+  map.colorSpace = THREE.SRGBColorSpace;
+  return { map, nrm };
+}
+
+/* ==========================================================================
+   GEOMETRY
+   ========================================================================== */
+function roundedRectShape(x, y, w, h, r, target = new THREE.Shape()) {
+  target.moveTo(x + r, y); target.lineTo(x + w - r, y); target.absarc(x + w - r, y + r, r, -Math.PI / 2, 0);
+  target.lineTo(x + w, y + h - r); target.absarc(x + w - r, y + h - r, r, 0, Math.PI / 2);
+  target.lineTo(x + r, y + h); target.absarc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
+  target.lineTo(x, y + r); target.absarc(x + r, y + r, r, Math.PI, Math.PI * 1.5);
+  return target;
+}
+function remapUV(geo, x0, y0, w, h) {
+  const p = geo.attributes.position, uv = geo.attributes.uv;
+  for (let i = 0; i < p.count; i++) uv.setXY(i, (p.getX(i) - x0) / w, (p.getY(i) - y0) / h);
+  uv.needsUpdate = true;
+}
+
+const cardGroup = new THREE.Group();   // origin = slot centre, +y up the card, +z out of the card front
+const clipGroup = new THREE.Group();   // origin = slot centre, +y toward the crimp
+scene.add(cardGroup, clipGroup);
+cardGroup.matrixAutoUpdate = clipGroup.matrixAutoUpdate = false;
+
+let caseMesh, cardMesh, strapMesh, wallMesh, wallMat;
+const pickables = [];
+
+async function buildObjects() {
+  const [cardTex, bgTex] = await Promise.all([loadTex(ASSETS.card), loadTex(ASSETS.bg)]);
+  bgTex.generateMipmaps = true;
+
+  /* ---- the page itself, as a wall that receives the shadows ---- */
+  wallMat = new THREE.ShaderMaterial({
+    toneMapped: false,
+    uniforms: {
+      uBg: { value: bgTex }, uMask: { value: null }, uImg: { value: new THREE.Vector4() },
+      uLightVP: { value: new THREE.Matrix4() }, uFrust: { value: new THREE.Vector2(1, 1) }, uRes: { value: new THREE.Vector2(1, 1) },
+      uHMax: { value: HMAX }, uLz: { value: CFG.lightDir.z },
+      uTanKey: { value: Math.tan(THREE.MathUtils.degToRad(CFG.keyAngle)) }, uTanAmb: { value: Math.tan(THREE.MathUtils.degToRad(CFG.ambAngle)) },
+      uKeyStr: { value: CFG.keyStrength }, uAmbStr: { value: CFG.ambStrength },
+    },
+    vertexShader: `varying vec3 vW; void main(){ vec4 w = modelMatrix * vec4(position,1.); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }`,
+    fragmentShader: /* glsl */`
+      precision highp float;
+      uniform sampler2D uBg, uMask; uniform vec4 uImg; uniform mat4 uLightVP; uniform vec2 uFrust, uRes;
+      uniform float uHMax, uLz, uTanKey, uTanAmb, uKeyStr, uAmbStr;
+      varying vec3 vW;
+      const float GA = 2.39996323;
+      float ign(vec2 p){ return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715)))); }
+      float lodFor(float worldRadius){ return log2(max(2.0 * worldRadius / uFrust.x * uRes.x, 1.0)); }
+      void main(){
+        vec2 iuv = (vW.xy - uImg.xy) / uImg.zw;
+        vec3 col = vec3(0.9387);   // #f8f8f8, matches the page paper
+        if (iuv.x >= 0. && iuv.x <= 1. && iuv.y >= 0. && iuv.y <= 1.) col = texture(uBg, iuv).rgb;
+
+        vec2 suv = (uLightVP * vec4(vW, 1.0)).xy * 0.5 + 0.5;
+        // mask: r = occlusion (1 card/strap/clip, ~0.2 clear plastic), g = height above the page × occlusion
+        float maxR = (uHMax * 0.6 / uLz) * uTanAmb;
+        vec4 coarse = textureLod(uMask, suv, lodFor(maxR));
+        float key = 0.0, amb = 0.0;
+        if (coarse.r > 0.0002) {
+          // --- soft ambient shadow: mip-filtered, radius grows with the caster's height ---
+          float h = coarse.g / coarse.r * uHMax;
+          float lA = lodFor((h / uLz) * uTanAmb);
+          vec4 m1 = textureLod(uMask, suv, lA);
+          if (m1.r > 0.0002) { h = m1.g / m1.r * uHMax; lA = lodFor((h / uLz) * uTanAmb); }
+          vec2 tx = exp2(lA) / uRes * 0.5;
+          amb = (2.0 * textureLod(uMask, suv, lA).r
+               + textureLod(uMask, suv + vec2( tx.x,  tx.y), lA).r + textureLod(uMask, suv + vec2(-tx.x,  tx.y), lA).r
+               + textureLod(uMask, suv + vec2( tx.x, -tx.y), lA).r + textureLod(uMask, suv + vec2(-tx.x, -tx.y), lA).r) / 6.0;
+
+          // --- tight key shadow: PCSS (blocker search → penumbra ∝ distance to the page) ---
+          float rot = ign(gl_FragCoord.xy) * 6.2831853;
+          vec2 sR = vec2((uHMax * 0.5 / uLz) * uTanKey) / uFrust;
+          float so = 0.0, sh = 0.0;
+          for (int i = 0; i < 12; i++) {
+            float r = sqrt((float(i) + 0.5) / 12.0), a = float(i) * GA + rot;
+            vec4 m = texture(uMask, suv + vec2(cos(a), sin(a)) * r * sR); so += m.r; sh += m.g;
+          }
+          if (so > 0.0005) {
+            float hb = sh / so * uHMax;
+            vec2 pr = max(vec2((hb / uLz) * uTanKey) / uFrust, 1.2 / uRes);
+            for (int i = 0; i < 28; i++) {
+              float r = sqrt((float(i) + 0.5) / 28.0), a = float(i) * GA + rot;
+              key += texture(uMask, suv + vec2(cos(a), sin(a)) * r * pr).r;
+            }
+            key /= 28.0;
+          }
+        }
+        float d = clamp(key * uKeyStr + amb * uAmbStr, 0.0, 0.85);
+        col *= 1.0 - d * vec3(1.0, 0.975, 0.935);   // shadows pick up a faint cool skylight tint
+        gl_FragColor = vec4(col, 1.0);
+        #include <colorspace_fragment>
+      }`,
+  });
+  wallMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), wallMat);
+  scene.add(wallMesh);
+
+  /* ---- the ID card: your art on the front, plain stock on the back, thin white core ---- */
+  const cardShape = roundedRectShape(-CARD_W / 2, CARD_CY - CARD_H / 2, CARD_W, CARD_H, 0.28);
+  const cardGeo = new THREE.ExtrudeGeometry(cardShape, { depth: 0.076, bevelEnabled: false, curveSegments: 12 });
+  cardGeo.translate(0, 0, -0.038);
+  remapUV(cardGeo, -CARD_W / 2, CARD_CY - CARD_H / 2, CARD_W, CARD_H);
+  const cardMat = new THREE.ShaderMaterial({
+    toneMapped: false,
+    uniforms: { map: { value: cardTex }, uL: { value: CFG.lightDir }, uBack: { value: new THREE.Color(0xf3f3f1) },
+      uOcc: { value: null }, uLightVP: wallMat.uniforms.uLightVP, uFrust: wallMat.uniforms.uFrust, uHMax: { value: HMAX },
+      uLz: { value: CFG.lightDir.z }, uTanKey: wallMat.uniforms.uTanKey },
+    vertexShader: `varying vec2 vUv; varying vec3 vN; varying float vFront; varying vec3 vW;
+      void main(){ vUv = uv; vFront = normal.z; vN = normalize(mat3(modelMatrix) * normal); vec4 w = modelMatrix * vec4(position,1.); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }`,
+    fragmentShader: `uniform sampler2D map, uOcc; uniform vec3 uL; uniform vec3 uBack; uniform mat4 uLightVP; uniform vec2 uFrust;
+      uniform float uHMax, uLz, uTanKey; varying vec2 vUv; varying vec3 vN; varying float vFront; varying vec3 vW;
+      // shadow from the clip and strap only (they're the only things between the light and the card face)
+      float clipShadow(){
+        vec2 suv = (uLightVP * vec4(vW, 1.0)).xy * 0.5 + 0.5;
+        vec4 m = texture(uOcc, suv);
+        if (m.r < 0.002) { m = textureLod(uOcc, suv, 3.0); if (m.r < 0.002) return 0.0; }
+        float hb = m.g / max(m.r, 1e-3) * uHMax, dist = max(hb - vW.z, 0.0);
+        if (dist < 0.02) return 0.0;
+        vec2 r = vec2(max((dist / uLz) * uTanKey, 0.02)) / uFrust;
+        float s = 0.0;
+        for (int i = 0; i < 12; i++) { float a = float(i) * 2.39996, rr = sqrt((float(i) + 0.5) / 12.0);
+          vec4 q = texture(uOcc, suv + vec2(cos(a), sin(a)) * rr * r); s += (q.r > 0.002 && q.g / q.r * uHMax > vW.z + 0.02) ? q.r : 0.0; }
+        return s / 12.0;
+      }
+      void main(){
+        vec3 n = normalize(vN);
+        vec3 alb = vFront > 0.5 ? texture(map, vUv).rgb : uBack;
+        alb *= 1.0 - 0.38 * clipShadow() * step(0.5, vFront);
+        // Calibrated so the card is exactly its original colours when it faces you, and shades as it turns.
+        float lit = 0.80 + 0.225 * max(dot(n, uL), 0.0);
+        gl_FragColor = vec4(alb * min(lit, 1.03), 1.0);
+        #include <colorspace_fragment>
+      }`,
+  });
+  cardMatRef = cardMat;
+  const cardEdgeMat = new THREE.MeshStandardMaterial({ color: 0xf2f2f0, roughness: 0.6 });
+  cardMesh = new THREE.Mesh(cardGeo, [cardMat, cardEdgeMat]);
+  cardGroup.add(cardMesh);
+
+  /* ---- clear vinyl holder ---- */
+  const shape = roundedRectShape(-CASE_W / 2, CASE_BOT, CASE_W, CASE_H, CASE_R);
+  const hole = (x) => { const p = new THREE.Path(); p.absarc(x, 0, HOLE_R, 0, Math.PI * 2, true); return p; };
+  shape.holes.push(hole(-HOLE_X), hole(HOLE_X), roundedRectShape(-SLOT_W / 2, -SLOT_H / 2, SLOT_W, SLOT_H, SLOT_H / 2 - 0.001, new THREE.Path()));
+  const caseGeo = new THREE.ExtrudeGeometry(shape, {
+    depth: SLAB, bevelEnabled: true, bevelThickness: BEVEL_T, bevelSize: BEVEL_S, bevelOffset: -BEVEL_S, bevelSegments: 5, curveSegments: 40,
+  });
+  caseGeo.translate(0, 0, -SLAB / 2);
+  remapUV(caseGeo, -CASE_W / 2, CASE_BOT, CASE_W, CASE_H);
+  const tx = caseTextures();
+  const faceMat = new THREE.MeshPhysicalMaterial({
+    color: 0xffffff, metalness: 0, roughness: 1, roughnessMap: tx.rough,
+    transmission: 1, transmissionMap: tx.trans, thickness: 0.16, ior: 1.53,
+    attenuationColor: new THREE.Color(0.86, 0.93, 0.95), attenuationDistance: 0.9,   // faint blue-green PVC tint
+    specularIntensity: 1, normalMap: tx.normal, normalScale: new THREE.Vector2(0.45, 0.45),
+  });
+  const edgeMat = new THREE.MeshPhysicalMaterial({
+    color: 0xffffff, metalness: 0, roughness: 0.14, transmission: 0.72, thickness: 0.35, ior: 1.53,
+    attenuationColor: new THREE.Color(0.82, 0.9, 0.93), attenuationDistance: 0.5, specularIntensity: 1,
+  });
+  // three.js clamps physical roughness to ≥0.0525, which pushes the transmitted image half a mip down
+  // (visibly soft card art). Re-zero that floor and sample the un-blurred buffer directly when smooth.
+  faceMat.onBeforeCompile = (sh) => {
+    const chunk = THREE.ShaderChunk.transmission_pars_fragment.replace(
+      /float lod = log2\( transmissionSamplerSize\.x \) \* applyIorToRoughness\( roughness, ior \);\s*return textureBicubic\( transmissionSamplerMap, fragCoord\.xy, lod \);/,
+      `float lod = log2( transmissionSamplerSize.x ) * applyIorToRoughness( max( roughness - 0.0525, 0.0 ) * 1.6, ior );
+       return lod < 0.05 ? textureLod( transmissionSamplerMap, fragCoord.xy, 0.0 ) : textureBicubic( transmissionSamplerMap, fragCoord.xy, lod );`);
+    sh.fragmentShader = sh.fragmentShader.replace('#include <transmission_pars_fragment>', chunk);
+  };
+  caseMesh = new THREE.Mesh(caseGeo, [faceMat, edgeMat]);
+  cardGroup.add(caseMesh);
+  pickables.push(caseMesh, cardMesh);
+
+  /* ---- metal swivel clip ---- */
+  const metal = new THREE.MeshPhysicalMaterial({ color: 0xdfe2e6, metalness: 1, roughness: 0.24 });
+  const metalDark = new THREE.MeshPhysicalMaterial({ color: 0xb9bdc3, metalness: 1, roughness: 0.34 });
+  const hookPath = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(0, 0.95, 0.03), new THREE.Vector3(0, 0.55, 0.13), new THREE.Vector3(0, 0.12, 0.15),
+    new THREE.Vector3(0, -0.06, 0.09), new THREE.Vector3(0, -0.10, 0.0), new THREE.Vector3(0, -0.04, -0.10),
+    new THREE.Vector3(0, 0.22, -0.15), new THREE.Vector3(0, 0.42, -0.12),
+  ]);
+  const hook = new THREE.Mesh(new THREE.TubeGeometry(hookPath, 64, 0.052, 12, false), metal);
+  const capA = new THREE.Mesh(new THREE.SphereGeometry(0.052, 12, 8), metal); capA.position.set(0, 0.42, -0.12);
+  const eye = new THREE.Mesh(new THREE.TorusGeometry(0.15, 0.042, 12, 32), metal); eye.position.set(0, 1.05, 0); eye.rotation.y = Math.PI / 2;
+  const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.11, 0.13, 0.36, 24), metalDark); barrel.position.set(0, 1.36, 0);
+  const ring = new THREE.Mesh(new THREE.TorusGeometry(0.2, 0.045, 12, 32), metal); ring.position.set(0, 1.62, 0);
+  // folded sheet-metal end cap: body, a flared lip where the strap enters, and a pressed rivet
+  const crimp = new THREE.Mesh(new RoundedBoxGeometry(STRAP_W + 0.18, 0.62, 0.26, 3, 0.07), metal); crimp.position.set(0, CLIP_LEN - 0.4, 0);
+  const lip = new THREE.Mesh(new RoundedBoxGeometry(STRAP_W + 0.26, 0.14, 0.32, 2, 0.05), metal); lip.position.set(0, CLIP_LEN - 0.06, 0);
+  const neckC = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.2, 0.18, 20), metalDark); neckC.position.set(0, CLIP_LEN - 0.78, 0);
+  const rivet = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.3, 16), metalDark); rivet.rotation.x = Math.PI / 2; rivet.position.set(0, CLIP_LEN - 0.42, 0);
+  clipGroup.add(hook, capA, eye, barrel, ring, crimp, lip, neckC, rivet);
+
+  /* ---- woven strap ---- */
+  const st = strapTextures();
+  const strapMat = new THREE.MeshPhysicalMaterial({
+    color: 0xffffff, map: st.map, normalMap: st.nrm, normalScale: new THREE.Vector2(0.8, 0.8),
+    roughness: 0.78, metalness: 0, sheen: 1, sheenColor: new THREE.Color(0x2c2c30), sheenRoughness: 0.5, envMapIntensity: 0.7,
+  });
+  strapMesh = new THREE.Mesh(new THREE.BufferGeometry(), strapMat);
+  strapMesh.frustumCulled = false;
+  scene.add(strapMesh);
+
+  buildShadowCasters();
+}
+
+/* ==========================================================================
+   SHADOW MASK — rendered from the light; the page shader turns it into
+   contact-hardening key + ambient shadows (one light, two angular sizes)
+   ========================================================================== */
+const shadowScene = new THREE.Scene();
+shadowScene.matrixWorldAutoUpdate = false;
+const lightCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 300);
+let maskRT = null;
+const proxies = []; let cardOnlyProxies = [], occRT = null, cardMatRef = null;
+const casterMat = (occ) => new THREE.ShaderMaterial({
+  uniforms: { uOcc: { value: occ }, uHMax: { value: HMAX } },
+  vertexShader: `varying float vH; void main(){ vec4 w = modelMatrix * vec4(position,1.); vH = w.z; gl_Position = projectionMatrix * viewMatrix * w; }`,
+  fragmentShader: `uniform float uOcc, uHMax; varying float vH; void main(){ gl_FragColor = vec4(uOcc, clamp(vH / uHMax, 0., 1.) * uOcc, 0., 1.); }`,
+  side: THREE.DoubleSide, depthTest: false, depthWrite: false,
+  blending: THREE.CustomBlending, blendEquation: THREE.MaxEquation, blendSrc: THREE.OneFactor, blendDst: THREE.OneFactor,
+});
+function buildShadowCasters() {
+  const solid = casterMat(1.0), clear = casterMat(0.09);   // clear PVC passes ~90% of the light
+  const add = (src, mat) => { const p = new THREE.Mesh(src.geometry, mat); p.matrixAutoUpdate = false; p.frustumCulled = false; shadowScene.add(p); proxies.push([p, src]); };
+  add(cardMesh, solid); add(caseMesh, clear); add(strapMesh, solid);
+  cardOnlyProxies = proxies.slice(0, 2).map(([p]) => p);
+  clipGroup.children.forEach((m) => add(m, solid));
+}
+function renderShadowMask() {
+  proxies.forEach(([p, src]) => { p.geometry = src.geometry; p.matrixWorld.copy(src.matrixWorld); });
+  renderer.setRenderTarget(maskRT);
+  renderer.setClearColor(0x000000, 0); renderer.clear();
+  renderer.render(shadowScene, lightCam);
+  // second pass without the card/case: what shades the card face (clip + strap)
+  cardOnlyProxies.forEach((p) => (p.visible = false));
+  renderer.setRenderTarget(occRT); renderer.clear(); renderer.render(shadowScene, lightCam);
+  cardOnlyProxies.forEach((p) => (p.visible = true));
+  renderer.setRenderTarget(null);
+}
+
+/* ==========================================================================
+   PHYSICS — position-based verlet: strap loop over a neck, rigid card triangle
+   ========================================================================== */
+const P = { n: 0, x: [], y: [], z: [], qx: [], qy: [], qz: [], w: [], air: [], ax: [], ay: [], az: [] };
+let strapIdx = [], links = [], bends = [], iC, iT, iBL, iBR, neck, seg;
+const CARD_LOCAL = { T: [0, 0], BL: [-TRI_A, -TRI_H], BR: [TRI_A, -TRI_H] };
+const bary = (lx, ly) => {           // weights of a card-plane point w.r.t. the physics triangle
+  const wBR = (-ly / TRI_H + lx / TRI_A) / 2, wBL = (-ly / TRI_H - lx / TRI_A) / 2;
+  return [1 - wBL - wBR, wBL, wBR];
+};
+const CORNERS = [[-CASE_W / 2, CASE_TOP], [CASE_W / 2, CASE_TOP], [-CASE_W / 2, CASE_BOT], [CASE_W / 2, CASE_BOT]].map(([x, y]) => bary(x, y));
+
+function addParticle(x, y, z, mass, air) {
+  const i = P.n++;
+  P.x.push(x); P.y.push(y); P.z.push(z); P.qx.push(x); P.qy.push(y); P.qz.push(z);
+  P.w.push(mass > 0 ? 1 / mass : 0); P.air.push(air); P.ax.push(0); P.ay.push(0); P.az.push(0);
+  return i;
+}
+
+function buildRig(Cy) {
+  for (const k in P) if (Array.isArray(P[k])) P[k].length = 0;
+  P.n = 0; links = []; bends = [];
+  const z = CFG.depth;
+  neck = { x: 0, y: Cy + NECK_D, z, r: NECK_R };
+  const d = NECK_D, R = NECK_R, al = Math.asin(R / d), lt = Math.sqrt(d * d - R * R), arc = R * (Math.PI + 2 * al);
+  const L = 2 * lt + arc;
+  const PL = [neck.x - R * Math.cos(al), neck.y - R * Math.sin(al)], PR = [neck.x + R * Math.cos(al), neck.y - R * Math.sin(al)];
+  const pathAt = (s) => {
+    if (s < lt) { const t = s / lt; return [PL[0] * t, Cy + (PL[1] - Cy) * t]; }
+    if (s < lt + arc) { const a = Math.PI + al - ((s - lt) / R); return [neck.x + R * Math.cos(a), neck.y + R * Math.sin(a)]; }
+    const t = (s - lt - arc) / lt; return [PR[0] * (1 - t), PR[1] + (Cy - PR[1]) * t];
+  };
+  const segs = Math.round(L / 0.8);
+  seg = L / segs;
+  // A loop over a round neck: from a point at distance d the strap needs 2√(d²−R²) + R(π + 2·asin(R/d)).
+  // Solve for the farthest the clip can ever be from the neck — the strap's true inextensibility.
+  const need = (dd) => 2 * Math.sqrt(dd * dd - R * R) + R * (Math.PI + 2 * Math.asin(R / dd));
+  let lo = R * 1.001, hi = L;
+  for (let k = 0; k < 60; k++) { const m = (lo + hi) / 2; need(m) > L ? (hi = m) : (lo = m); }
+  neck.dmax = lo;
+  iC = addParticle(0, Cy, z, 0.6, CFG.airStrap);
+  strapIdx = [iC];
+  for (let k = 1; k < segs; k++) { const [x, y] = pathAt(k * seg); strapIdx.push(addParticle(x, y, z, 0.25, CFG.airStrap)); }
+  strapIdx.push(iC);
+  for (let k = 0; k < strapIdx.length - 1; k++) links.push([strapIdx[k], strapIdx[k + 1], seg]);
+  for (let k = 0; k < strapIdx.length - 2; k++) bends.push([strapIdx[k], strapIdx[k + 2], seg * 1.86]);
+  const Ty = Cy - CLIP_LEN;
+  iT = addParticle(0, Ty, z, 5, CFG.airCard);
+  iBL = addParticle(-TRI_A, Ty - TRI_H, z, 5, CFG.airCard);
+  iBR = addParticle(TRI_A, Ty - TRI_H, z, 5, CFG.airCard);
+}
+
+function distC(i, j, rest, k, mode) {   // mode 0: rigid, 1: rope (max only), -1: min only
+  const dx = P.x[j] - P.x[i], dy = P.y[j] - P.y[i], dz = P.z[j] - P.z[i];
+  const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (d < 1e-9 || (mode > 0 && d <= rest) || (mode < 0 && d >= rest)) return;
+  const wi = P.w[i], wj = P.w[j], ws = wi + wj; if (!ws) return;
+  const c = (d - rest) / (d * ws) * k;
+  P.x[i] += dx * c * wi; P.y[i] += dy * c * wi; P.z[i] += dz * c * wi;
+  P.x[j] -= dx * c * wj; P.y[j] -= dy * c * wj; P.z[j] -= dz * c * wj;
+}
+function weighted(ws, k, dx, dy, dz) {   // move a point expressed as Σ wᵢ·pᵢ of the card triangle
+  const ids = [iT, iBL, iBR], n2 = ws[0] ** 2 + ws[1] ** 2 + ws[2] ** 2;
+  for (let m = 0; m < 3; m++) { const f = ws[m] / n2 * k, i = ids[m]; P.x[i] += dx * f; P.y[i] += dy * f; P.z[i] += dz * f; }
+}
+const evalW = (ws, arr) => ws[0] * arr[iT] + ws[1] * arr[iBL] + ws[2] * arr[iBR];
+
+const F = { T: new THREE.Vector3(), M: new THREE.Vector3(), up: new THREE.Vector3(), xa: new THREE.Vector3(), n: new THREE.Vector3() };
+function cardFrame() {
+  F.T.set(P.x[iT], P.y[iT], P.z[iT]);
+  F.M.set((P.x[iBL] + P.x[iBR]) / 2, (P.y[iBL] + P.y[iBR]) / 2, (P.z[iBL] + P.z[iBR]) / 2);
+  F.up.subVectors(F.T, F.M).normalize();
+  F.xa.set(P.x[iBR] - P.x[iBL], P.y[iBR] - P.y[iBL], P.z[iBR] - P.z[iBL]);
+  F.xa.addScaledVector(F.up, -F.xa.dot(F.up)).normalize();
+  F.n.crossVectors(F.xa, F.up);
+  return F;
+}
+const _zAxis = new THREE.Vector3(0, 0, 1);
+const _v = new THREE.Vector3(), _q = new THREE.Quaternion(), _a = new THREE.Vector3(), _b = new THREE.Vector3();
+function rotateCardAround(axis, origin, angle) {
+  _q.setFromAxisAngle(axis, angle);
+  for (const i of [iBL, iBR]) {
+    _v.set(P.x[i], P.y[i], P.z[i]).sub(origin).applyQuaternion(_q).add(origin);
+    P.x[i] = _v.x; P.y[i] = _v.y; P.z[i] = _v.z;
+  }
+}
+
+/* ---- interaction state ---- */
+const hover = { yaw: 0, pitch: 0, lean: 0, infl: 0 };
+const drag = { active: false, w: null, z0: 0, lift: 0, tx: 0, ty: 0, tz: 0, sx: 0, sy: 0, sz: 0 };
+let simRunning = false;
+
+function step(dt) {
+  const dt2 = dt * dt, g = CFG.gravity, vmax = CFG.maxSpeed * dt;
+  const ids = [iT, iBL, iBR];
+
+  // damp the card's rotation modes separately from its translation
+  let mx = 0, my = 0, mz = 0;
+  for (const i of ids) { mx += P.x[i] - P.qx[i]; my += P.y[i] - P.qy[i]; mz += P.z[i] - P.qz[i]; }
+  mx /= 3; my /= 3; mz /= 3;
+  const rd = 1 - CFG.rotDamp * dt;
+  for (const i of ids) {
+    const vx = mx + (P.x[i] - P.qx[i] - mx) * rd, vy = my + (P.y[i] - P.qy[i] - my) * rd, vz = mz + (P.z[i] - P.qz[i] - mz) * rd;
+    P.qx[i] = P.x[i] - vx; P.qy[i] = P.y[i] - vy; P.qz[i] = P.z[i] - vz;
+  }
+
+  const ceiling = view.Hv + 4;
+  for (let i = 0; i < P.n; i++) {
+    if (!P.w[i]) continue;
+    const a = 1 - P.air[i] * dt;
+    let vx = (P.x[i] - P.qx[i]) * a, vy = (P.y[i] - P.qy[i]) * a, vz = (P.z[i] - P.qz[i]) * a;
+    if ((i === iC || i >= iT) && vy > 0 && P.y[i] > ceiling) vy *= 0.9;   // soft ceiling: a big throw arcs back instead of vanishing
+    const sp = Math.sqrt(vx * vx + vy * vy + vz * vz); if (sp > vmax) { const s = vmax / sp; vx *= s; vy *= s; vz *= s; }
+    P.qx[i] = P.x[i]; P.qy[i] = P.y[i]; P.qz[i] = P.z[i];
+    P.x[i] += vx + P.ax[i] * dt2; P.y[i] += vy + (P.ay[i] - g) * dt2; P.z[i] += vz + P.az[i] * dt2;
+  }
+
+  // strap torsion: spring the card's facing toward the camera (or toward the cursor while hovering)
+  const f = cardFrame();
+  _a.set(0, 0, 1).addScaledVector(f.up, -f.up.z);
+  if (_a.lengthSq() > 1e-4) {
+    _a.normalize().applyAxisAngle(f.up, THREE.MathUtils.degToRad(CFG.hover.yaw) * hover.yaw);
+    _b.crossVectors(f.n, _a);
+    const err = Math.atan2(_b.dot(f.up), f.n.dot(_a));
+    const kT = (2 * Math.PI * CFG.torsionHz * dt) ** 2;
+    rotateCardAround(f.up, f.T, err * kT);
+  }
+
+  // hover: soft rotational springs about the pivot (pitch toward / lean toward the cursor).
+  // They only exist while the cursor is near, so the free swing keeps its natural pendulum feel.
+  if (hover.infl > 0.001) {
+    const h = cardFrame(), kH = (2 * Math.PI * 1.3 * dt) ** 2 * hover.infl, D = THREE.MathUtils.degToRad;
+    const pitchCur = Math.atan2(-h.up.z, h.up.y), rollCur = Math.atan2(-h.up.x, h.up.y);
+    rotateCardAround(h.xa, h.T, -(D(CFG.hover.pitch) * hover.pitch - pitchCur) * kH);
+    rotateCardAround(_zAxis, cardFrame().T, (D(CFG.hover.lean) * hover.lean - rollCur) * kH);
+  }
+
+  // drag target follows the pointer through a short spring (the reference's ~0.1 s lag)
+  if (drag.active) {
+    const s = 1 - Math.exp(-CFG.drag.follow * dt);
+    drag.sx += (drag.tx - drag.sx) * s; drag.sy += (drag.ty - drag.sy) * s; drag.sz += (drag.tz - drag.sz) * s;
+  }
+
+  const fr = CFG.neckFriction * dt / CFG.iterations;
+  for (let it = 0; it < CFG.iterations; it++) {
+    for (const [i, j, r] of links) distC(i, j, r, 1, 1);   // woven strap: no stretch, only slack
+    for (const [i, j, r] of bends) distC(i, j, r, 0.4, -1);
+    for (const i of strapIdx) {                         // strap slides over the neck with a little friction
+      const dx = P.x[i] - neck.x, dy = P.y[i] - neck.y, d = Math.hypot(dx, dy);
+      if (d < neck.r + STRAP_T) {
+        const s = (neck.r + STRAP_T) / Math.max(d, 1e-6);
+        P.x[i] = neck.x + dx * s; P.y[i] = neck.y + dy * s; P.z[i] += (neck.z - P.z[i]) * 0.5;
+        P.qx[i] += (P.x[i] - P.qx[i]) * fr; P.qy[i] += (P.y[i] - P.qy[i]) * fr;
+      }
+      if (P.z[i] < 0.05) P.z[i] = 0.05;
+    }
+    {   // strap length limit, applied to clip + card as one body so the heavy card can't out-pull it
+      const dx = P.x[iC] - neck.x, dy = P.y[iC] - neck.y, dz = P.z[iC] - neck.z, d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d > neck.dmax) {
+        const c = (1 - neck.dmax / d) * CFG.tetherK, ox = -dx * c, oy = -dy * c, oz = -dz * c;
+        for (const i of [iC, iT, iBL, iBR]) { P.x[i] += ox; P.y[i] += oy; P.z[i] += oz; }
+      }
+    }
+    const last = strapIdx.length - 1;
+    for (let k = 1; k < last; k++) {
+      const i = strapIdx[k], lim = Math.min(k, last - k) * seg;
+      const dx = P.x[i] - P.x[iC], dy = P.y[i] - P.y[iC], dz = P.z[i] - P.z[iC], d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d > lim) { const c = (d - lim) / d; P.x[i] -= dx * c; P.y[i] -= dy * c; P.z[i] -= dz * c; P.qx[i] -= dx * c; P.qy[i] -= dy * c; P.qz[i] -= dz * c; }
+    }
+    distC(iC, iT, CLIP_LEN, 1, 0);
+    distC(iT, iBL, Math.hypot(TRI_A, TRI_H), 1, 0);
+    distC(iT, iBR, Math.hypot(TRI_A, TRI_H), 1, 0);
+    distC(iBL, iBR, TRI_A * 2, 1, 0);
+    if (drag.active) {
+      weighted(drag.w, CFG.drag.stiffness, drag.sx - evalW(drag.w, P.x), drag.sy - evalW(drag.w, P.y), drag.sz - evalW(drag.w, P.z));
+    }
+    for (const cw of CORNERS) {                         // the case can't pass through the page
+      const zc = evalW(cw, P.z);
+      if (zc < 0.14) weighted(cw, 1, 0, 0, 0.14 - zc);
+    }
+  }
+}
+
+/* ==========================================================================
+   LAYOUT
+   ========================================================================== */
+const view = { Hv: 26, Wv: 40, aspect: 1, imgH: 0 };
+function layout() {
+  const w = innerWidth, h = innerHeight, aspect = w / h;
+  renderer.setSize(w, h, false);
+  let Hv = Math.max(26, 15.5 / aspect);
+  let Wv = Hv * aspect, imgH = Wv / IMG_ASPECT;
+  const nameOverlap = imgH * 0.154 * 0.62;               // case bottom tucks just into the top of the big name
+  let caseBottom = aspect < 1 ? Math.max(nameOverlap, Hv * 0.42 - 7) : nameOverlap;
+  let Cy = caseBottom - CASE_BOT + CLIP_LEN;
+  if (Cy > Hv - 3) { Hv = Cy + 3; Wv = Hv * aspect; imgH = Wv / IMG_ASPECT; }
+  Object.assign(view, { Hv, Wv, aspect, imgH, caseBottom, Cy });
+
+  camera.aspect = aspect; camera.position.set(0, Hv / 2, (Hv / 2) / FOV_T); camera.lookAt(0, Hv / 2, 0); camera.updateProjectionMatrix();
+  wallMesh.scale.set(Wv * 1.6, Hv * 1.6, 1); wallMesh.position.set(0, Hv / 2, 0);
+  wallMat.uniforms.uImg.value.set(-Wv / 2, 0, Wv, imgH);
+
+  // light: orthographic, aimed at the page centre from the light direction
+  const fw = Wv + 14, fh = Hv + 14;
+  const tgt = new THREE.Vector3(0, Hv / 2, 0);
+  lightCam.left = -fw / 2; lightCam.right = fw / 2; lightCam.top = fh / 2; lightCam.bottom = -fh / 2;
+  lightCam.position.copy(tgt).addScaledVector(CFG.lightDir, 120); lightCam.lookAt(tgt); lightCam.updateProjectionMatrix(); lightCam.updateMatrixWorld();
+  keyLight.position.copy(tgt).addScaledVector(CFG.lightDir, 100); keyLight.target.position.copy(tgt); keyLight.target.updateMatrixWorld();
+  const res = 2048, rx = fw >= fh ? res : Math.round(res * fw / fh), ry = fw >= fh ? Math.round(res * fh / fw) : res;
+  if (maskRT) maskRT.dispose();
+  maskRT = new THREE.WebGLRenderTarget(rx, ry, { generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
+  wallMat.uniforms.uMask.value = maskRT.texture;
+  if (occRT) occRT.dispose();
+  occRT = new THREE.WebGLRenderTarget(rx, ry, { generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, depthBuffer: false });
+  cardMatRef.uniforms.uOcc.value = occRT.texture;
+  wallMat.uniforms.uLightVP.value.multiplyMatrices(lightCam.projectionMatrix, lightCam.matrixWorldInverse);
+  wallMat.uniforms.uFrust.value.set(fw, fh);
+  wallMat.uniforms.uRes.value.set(rx, ry);
+}
+
+function settleAtRest() {
+  buildRig(view.Cy);
+  const save = CFG.airCard; CFG.airCard = 6;
+  for (let i = 0; i < P.n; i++) P.air[i] = 6;
+  for (let k = 0; k < 480; k++) step(CFG.substep);
+  for (let i = 0; i < P.n; i++) P.air[i] = strapIdx.includes(i) ? CFG.airStrap : save;
+  CFG.airCard = save;
+  // the strap stretches a hair under load; shift the whole rig so the card lands exactly where intended
+  const f = cardFrame();
+  const bottom = f.T.y + f.up.y * CASE_BOT;
+  const dy = view.caseBottom - bottom;
+  for (let i = 0; i < P.n; i++) P.y[i] += dy;
+  neck.y += dy;
+  for (let i = 0; i < P.n; i++) { P.qx[i] = P.x[i]; P.qy[i] = P.y[i]; P.qz[i] = P.z[i]; }
+}
+
+function prepareDropIn() {
+  // lift the card (and the strap near it) just above the viewport; the strap above goes slack
+  const lift = view.Hv - view.caseBottom + 1.5;
+  // the whole lanyard (strap uncompressed) falls together and catches on the neck — a clean vertical drop
+  for (let i = 0; i < P.n; i++) if (i !== iC && i < iT) P.y[i] += lift;
+  for (const i of [iC, iT, iBL, iBR]) P.y[i] += lift;
+  // enter with a little roll and twist, so the catch sets up a natural swing
+  const f = cardFrame();
+  rotateCardAround(new THREE.Vector3(0, 0, 1), f.T, THREE.MathUtils.degToRad(10));
+  rotateCardAround(cardFrame().up, cardFrame().T, THREE.MathUtils.degToRad(-28));
+  for (let i = 0; i < P.n; i++) { P.qx[i] = P.x[i] + (i === iBL || i === iBR ? -0.012 : 0); P.qy[i] = P.y[i]; P.qz[i] = P.z[i]; }
+}
+
+/* ==========================================================================
+   PER-FRAME SYNC: physics → meshes
+   ========================================================================== */
+const _m = new THREE.Matrix4(), _cx = new THREE.Vector3(), _cy = new THREE.Vector3(), _cz = new THREE.Vector3();
+function syncMeshes() {
+  const f = cardFrame();
+  _m.makeBasis(f.xa, f.up, f.n).setPosition(f.T);
+  cardGroup.matrix.copy(_m); cardGroup.matrixWorldNeedsUpdate = true;
+
+  _cy.set(P.x[iC] - f.T.x, P.y[iC] - f.T.y, P.z[iC] - f.T.z).normalize();
+  _cx.copy(f.xa).addScaledVector(_cy, -f.xa.dot(_cy)).normalize();
+  _cz.crossVectors(_cx, _cy);
+  _m.makeBasis(_cx, _cy, _cz).setPosition(f.T);
+  clipGroup.matrix.copy(_m); clipGroup.matrixWorldNeedsUpdate = true;
+
+  updateStrap(_cx, _cy, _cz);
+  scene.updateMatrixWorld();
+}
+
+/* ---- strap ribbon (rectangular cross-section, so its edges catch light) ---- */
+let strapPos, strapNrm, strapUV, strapRings = 0;
+const pts = [], wdir = [];
+function updateStrap(cx, cy, cz) {
+  // chain → smooth curve (Catmull-Rom ×2), with each end extended down into the crimp
+  const ctrl = strapIdx.map((i) => new THREE.Vector3(P.x[i], P.y[i], P.z[i]));
+  const C = ctrl[0];
+  const inCrimp = C.clone().addScaledVector(cy, -0.5);
+  ctrl.unshift(inCrimp.clone()); ctrl.push(inCrimp.clone());
+  const curve = new THREE.CatmullRomCurve3(ctrl, false, 'centripetal');
+  const n = ctrl.length * 2;
+  const samples = curve.getSpacedPoints(n);
+  const total = curve.getLength();
+  if (strapRings !== samples.length) {
+    strapRings = samples.length;
+    const vcount = strapRings * 8;
+    strapPos = new Float32Array(vcount * 3); strapNrm = new Float32Array(vcount * 3); strapUV = new Float32Array(vcount * 2);
+    const idx = [];
+    for (let r = 0; r < strapRings - 1; r++) for (let f = 0; f < 4; f++) {
+      const a = r * 8 + f * 2, b = a + 8;
+      idx.push(a, b, a + 1, a + 1, b, b + 1);
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(strapPos, 3).setUsage(THREE.DynamicDrawUsage));
+    geo.setAttribute('normal', new THREE.BufferAttribute(strapNrm, 3).setUsage(THREE.DynamicDrawUsage));
+    geo.setAttribute('uv', new THREE.BufferAttribute(strapUV, 2).setUsage(THREE.DynamicDrawUsage));
+    geo.setIndex(idx);
+    strapMesh.geometry.dispose(); strapMesh.geometry = geo;
+  }
+  const t = new THREE.Vector3(), w = new THREE.Vector3(), nn = new THREE.Vector3(), Z = new THREE.Vector3(0, 0, 1), prevW = new THREE.Vector3();
+  const cxPerp = new THREE.Vector3();
+  for (let r = 0; r < strapRings; r++) {
+    const p = samples[r];
+    const a = samples[Math.max(r - 1, 0)], b = samples[Math.min(r + 1, strapRings - 1)];
+    t.subVectors(b, a).normalize();
+    w.crossVectors(Z, t); if (w.lengthSq() < 1e-6) w.copy(prevW); w.normalize();
+    // near either end the strap is clamped in the crimp: align its width with the clip and twist into it
+    const sFromEnd = Math.min(r, strapRings - 1 - r) / (strapRings - 1) * total;
+    const blend = 1 - THREE.MathUtils.smoothstep(sFromEnd, 0.4, 3.0);
+    cxPerp.copy(cx).addScaledVector(t, -cx.dot(t)).normalize();
+    if (cxPerp.dot(w) < 0) cxPerp.negate();
+    w.lerp(cxPerp, blend).normalize();
+    if (r > 0 && w.dot(prevW) < 0) w.negate();
+    prevW.copy(w);
+    nn.crossVectors(w, t).normalize();
+    // gentle natural twist along the strap (zero where it's clamped in the crimp)
+    const sAlong = r / (strapRings - 1) * total;
+    const tw = (1 - blend) * (0.32 * Math.sin(sAlong * 0.16 + 0.7) + 0.12 * Math.sin(sAlong * 0.41 + 2.1));
+    w.applyAxisAngle(t, tw); nn.crossVectors(w, t).normalize();
+    // separate the two overlapping ends inside the crimp
+    const side = r < strapRings / 2 ? 1 : -1;
+    const off = blend * 0.05 * side;
+    const cxp = p.x + cz.x * off, cyp = p.y + cz.y * off, czp = p.z + cz.z * off;
+    const hw = STRAP_W / 2, ht = STRAP_T / 2;
+    const v = r / (strapRings - 1) * total / 3.2;
+    const corners = [
+      [+1, +1, nn, 0], [-1, +1, nn, 1],        // front face
+      [-1, -1, nn, 0, true], [+1, -1, nn, 1, true],   // back face
+      [-1, +1, w, 0, 'L'], [-1, -1, w, 1, 'L'],       // left edge
+      [+1, -1, w, 0, 'R'], [+1, +1, w, 1, 'R'],       // right edge
+    ];
+    for (let c = 0; c < 8; c++) {
+      const [sw, sn, , u] = corners[c];
+      const vi = r * 8 + c;
+      strapPos[vi * 3] = cxp + w.x * hw * sw + nn.x * ht * sn;
+      strapPos[vi * 3 + 1] = cyp + w.y * hw * sw + nn.y * ht * sn;
+      strapPos[vi * 3 + 2] = czp + w.z * hw * sw + nn.z * ht * sn;
+      let nx, ny, nz;
+      if (c < 2) { nx = nn.x; ny = nn.y; nz = nn.z; } else if (c < 4) { nx = -nn.x; ny = -nn.y; nz = -nn.z; }
+      else if (c < 6) { nx = -w.x; ny = -w.y; nz = -w.z; } else { nx = w.x; ny = w.y; nz = w.z; }
+      strapNrm[vi * 3] = nx; strapNrm[vi * 3 + 1] = ny; strapNrm[vi * 3 + 2] = nz;
+      strapUV[vi * 2] = c < 4 ? u : (c % 2 ? 0.02 : 0); strapUV[vi * 2 + 1] = v;
+    }
+  }
+  const g = strapMesh.geometry;
+  g.attributes.position.needsUpdate = g.attributes.normal.needsUpdate = g.attributes.uv.needsUpdate = true;
+  g.computeBoundingSphere();
+}
+
+/* ==========================================================================
+   POINTER
+   ========================================================================== */
+const ndc = new THREE.Vector2(), ray = new THREE.Raycaster();
+const pointer = { inside: false, x: 0, y: 0, type: 'mouse' };
+function setPointer(e) {
+  const r = canvas.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  pointer.type = e.pointerType;
+}
+function pointerOnPlane(z, out) {
+  ray.setFromCamera(ndc, camera);
+  const t = (z - ray.ray.origin.z) / ray.ray.direction.z;
+  return out.copy(ray.ray.origin).addScaledVector(ray.ray.direction, t);
+}
+function pick() { ray.setFromCamera(ndc, camera); return ray.intersectObjects(pickables, false)[0] || null; }
+
+const _p = new THREE.Vector3();
+canvas.addEventListener('pointerdown', (e) => {
+  if (!simRunning) return;
+  setPointer(e);
+  const hit = pick(); if (!hit) return;
+  const f = cardFrame();
+  _v.subVectors(hit.point, f.T);
+  drag.w = bary(_v.dot(f.xa), _v.dot(f.up));
+  drag.z0 = hit.point.z; drag.lift = 0;
+  drag.sx = drag.tx = hit.point.x; drag.sy = drag.ty = hit.point.y; drag.sz = drag.tz = hit.point.z;
+  drag.active = true;
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  canvas.style.cursor = 'grabbing';
+  e.preventDefault();
+});
+canvas.addEventListener('pointermove', (e) => { setPointer(e); pointer.inside = e.pointerType === 'mouse' || drag.active; });
+const endDrag = (e) => {
+  if (!drag.active) return;
+  drag.active = false;
+  try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+  if (e.pointerType !== 'mouse') pointer.inside = false;
+};
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+canvas.addEventListener('pointerleave', () => { if (!drag.active) pointer.inside = false; });
+addEventListener('blur', () => { pointer.inside = false; });
+
+function updateInteraction(dt) {
+  if (drag.active) {
+    drag.lift += (CFG.drag.lift - drag.lift) * (1 - Math.exp(-dt * 6));   // card comes toward you when held
+    pointerOnPlane(drag.z0 + drag.lift, _p);
+    drag.tx = _p.x; drag.ty = _p.y; drag.tz = _p.z;
+  }
+  // hover tilt toward the cursor (desktop only), springing through the physics
+  let yaw = 0, pitch = 0, lean = 0, infl = 0;
+  if (pointer.inside && !drag.active && !REDUCED && pointer.type === 'mouse') {
+    const f = cardFrame();
+    const cx = f.T.x + f.up.x * (CASE_BOT / 2 + CASE_TOP / 2), cy = f.T.y + f.up.y * (CASE_BOT / 2 + CASE_TOP / 2);
+    pointerOnPlane(f.T.z, _p);
+    const dx = (_p.x - cx) / (CASE_W * 0.5), dy = (_p.y - cy) / (CASE_H * 0.5);
+    infl = 1 - THREE.MathUtils.smoothstep(Math.hypot(dx, dy), 0.9, 3.2);
+    yaw = THREE.MathUtils.clamp(dx * 0.8, -1, 1) * infl;
+    pitch = THREE.MathUtils.clamp(dy * 0.8, -1, 1);
+    lean = THREE.MathUtils.clamp(dx * 0.6, -1, 1);
+  }
+  // ease the influence in/out so entering the zone doesn't kick the card
+  hover.infl += (infl - hover.infl) * (1 - Math.exp(-dt * 5));
+  hover.yaw = yaw; hover.pitch = pitch; hover.lean = lean;
+  if (!drag.active) {
+    let over = false;
+    if (pointer.inside && pointer.type === 'mouse') { over = !!pick(); }
+    canvas.style.cursor = over ? 'grab' : '';
+  }
+}
+
+/* ==========================================================================
+   MAIN
+   ========================================================================== */
+await buildObjects();
+layout();
+settleAtRest();
+if (!REDUCED) prepareDropIn();
+syncMeshes();
+
+let resizeT = 0;
+addEventListener('resize', () => {
+  clearTimeout(resizeT);
+  resizeT = setTimeout(() => { layout(); settleAtRest(); syncMeshes(); }, 120);
+});
+
+window.__lanyard = { paused: new URLSearchParams(location.search).has('hold') };
+let acc = 0, last = performance.now(), first = true;
+const startAt = performance.now() + (REDUCED ? 0 : 450);
+renderer.setAnimationLoop((now) => {
+  const dt = Math.min((now - last) / 1000, 1 / 20); last = now;
+  if (!simRunning && now >= startAt) simRunning = true;
+  if (simRunning && !window.__lanyard.paused) {
+    updateInteraction(dt);
+    acc += dt;
+    while (acc >= CFG.substep) { step(CFG.substep); acc -= CFG.substep; }
+    // safety net: if the rig ever ends up somewhere absurd, quietly re-hang it with the drop-in
+    const ty = P.y[iT], tx = P.x[iT];
+    if (!Number.isFinite(ty + tx + P.z[iT]) || ty > neck.y + 25 || Math.abs(tx) > 80) {
+      drag.active = false; settleAtRest(); if (!REDUCED) prepareDropIn();
+    }
+  }
+  syncMeshes();
+  renderShadowMask();
+  renderer.render(scene, camera);
+  if (first) { first = false; canvas.classList.add('ready'); }
+  adaptResolution(now);
+});
+
+// Keep it smooth on slower GPUs: if frames run long for a while, step the render resolution down a notch.
+let slowSince = 0, fpsEMA = 60, lastFrame = 0;
+function adaptResolution(now) {
+  if (lastFrame) fpsEMA += (1000 / Math.max(now - lastFrame, 1) - fpsEMA) * 0.05;
+  lastFrame = now;
+  if (fpsEMA < 48 && pixelRatio > 1) {
+    slowSince = slowSince || now;
+    if (now - slowSince > 1500) {
+      pixelRatio = Math.max(1, pixelRatio - 0.25);
+      renderer.setPixelRatio(pixelRatio); renderer.setSize(innerWidth, innerHeight, false);
+      slowSince = 0; fpsEMA = 60;
+    }
+  } else slowSince = 0;
+}
+document.addEventListener('visibilitychange', () => { lastFrame = 0; fpsEMA = 60; slowSince = 0; });
+
+// debug hook for tuning in the console
+window.__lanyard = { CFG, P, view, cardFrame, step, syncMeshes, paused: window.__lanyard.paused, setPointerNDC(x, y, inside = true) { ndc.set(x, y); pointer.inside = inside; pointer.type = 'mouse'; }, updateInteraction, simulate(sec) { simRunning = true; for (let t = 0; t < sec; t += 1 / 60) { updateInteraction(1 / 60); for (let k = 0; k < 4; k++) step(CFG.substep); } }, renderNow() { syncMeshes(); renderShadowMask(); renderer.render(scene, camera); }, advance(sec) { for (let t = 0; t < sec; t += CFG.substep) step(CFG.substep); }, get drag() { return drag; }, get maskRT() { return maskRT; }, renderer, scene, camera, wallMat };
+</script>
+</body>
+</html>
